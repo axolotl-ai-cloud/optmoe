@@ -7,6 +7,11 @@ on:
     branches:
       - "release/**" # builds only; the release and publish jobs run on tags
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build kernel wheels for and attach them to (e.g. v0.1.0)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -46,9 +51,9 @@ jobs:
       fail-fast: false
       matrix:
         python: ["3.12", "3.14"]
-        torch: ["2.14.1"]
-        cuda: ["13.0.2"]
-        torch-index: ["cu130"]
+        build:
+          - { torch: "2.14.1", cuda: "13.0.2", torch-index: "cu130" }
+          - { torch: "2.15.0", cuda: "13.2.1", torch-index: "cu132" }
     steps:
       - name: Free disk space
         run: |
@@ -59,17 +64,20 @@ jobs:
         with:
           persist-credentials: false
       - name: Build the extension wheel
+        env:
+          ATTACH_TAG: ${{ inputs.tag }}
         run: |
           version=0.0.0.dev0
           case "$GITHUB_REF" in
             refs/tags/v*) version="${GITHUB_REF_NAME#v}" ;;
           esac
+          if [ -n "$ATTACH_TAG" ]; then version="${ATTACH_TAG#v}"; fi
           docker run --rm -v "$PWD:/work" -w /work \
-            "nvidia/cuda:${{ matrix.cuda }}-devel-ubuntu24.04" \
-            tools/build_kernel_wheel.sh "${{ matrix.python }}" "${{ matrix.torch }}" "${{ matrix.torch-index }}" "$version"
+            "nvidia/cuda:${{ matrix.build.cuda }}-devel-ubuntu24.04" \
+            tools/build_kernel_wheel.sh "${{ matrix.python }}" "${{ matrix.build.torch }}" "${{ matrix.build.torch-index }}" "$version"
       - uses: actions/upload-artifact@v4
         with:
-          name: kernels-py${{ matrix.python }}-torch${{ matrix.torch }}-${{ matrix.torch-index }}
+          name: kernels-py${{ matrix.python }}-torch${{ matrix.build.torch }}-${{ matrix.build.torch-index }}
           path: vendor/deepgemm/dist/*.whl
 
   release:
@@ -89,6 +97,26 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: gh release create "$GITHUB_REF_NAME" kernels/*.whl --title "$GITHUB_REF_NAME" --generate-notes
+
+  # Manual run with a tag: add wheels (a new torch or Python) to a release that already exists
+  attach:
+    if: github.event_name == 'workflow_dispatch' && inputs.tag != ''
+    needs: kernels
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kernels-*
+          merge-multiple: true
+          path: kernels/
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+        run: gh release upload "$TAG" kernels/*.whl --clobber
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
