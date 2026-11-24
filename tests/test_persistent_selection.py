@@ -1,0 +1,376 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Axolotl AI
+
+"""Backend selection fails explicitly before allocating unsupported workspaces."""
+
+import sys
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import torch
+from optmoe import PersistentMoE
+from optmoe.runtime import _RUNTIMES, _check_sm_budget
+
+
+@pytest.mark.parametrize("current,allocated", [(116, 116), (132, 116), (116, 132)])
+def test_workspace_sm_budget_is_frozen(monkeypatch, current, allocated):
+    monkeypatch.setitem(
+        sys.modules, "optmoe_deepgemm", SimpleNamespace(get_num_sms=lambda: current)
+    )
+    runtime = SimpleNamespace(num_sms=116, buffer=SimpleNamespace(num_sms=allocated))
+    if current == allocated == 116:
+        _check_sm_budget(runtime)
+    else:
+        with pytest.raises(RuntimeError, match="SM count changed"):
+            _check_sm_budget(runtime)
+
+
+@pytest.mark.parametrize(
+    "arch,reserved,current,match",
+    [
+        (9, -1, 132, "leave at least two"),
+        (9, 131, 1, "leave at least two"),
+        (10, 15, 117, "even active"),
+        (9, 16, 132, "set_num_sms"),
+    ],
+)
+def test_invalid_sm_reservation_before_allocation(
+    monkeypatch, arch, reserved, current, match
+):
+    allocate = Mock()
+    monkeypatch.setitem(
+        sys.modules,
+        "optmoe_deepgemm",
+        SimpleNamespace(
+            get_num_sms=lambda: current,
+            get_symm_buffer_for_optmoe=allocate,
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (arch, 0))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=132),
+    )
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    with pytest.raises(ValueError, match=match):
+        PersistentMoE(None, 8, 128, 4, 512, 512, reserved_sms=reserved)
+    allocate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "options,match",
+    [
+        ({"backward_backend": "unknown"}, "backward_backend"),
+        (
+            {"compute_dtype": "blockwise", "retain_activations": True},
+            "requires recomputation",
+        ),
+        (
+            {"backward_backend": "native", "compute_dtype": "nvfp4_lora"},
+            "recomputing BF16",
+        ),
+        (
+            {"backward_backend": "native", "retain_activations": True},
+            "recomputing BF16",
+        ),
+    ],
+)
+def test_invalid_selection_before_extension_import(monkeypatch, options, match):
+    monkeypatch.setitem(sys.modules, "optmoe_deepgemm", None)
+    with pytest.raises(ValueError, match=match):
+        PersistentMoE(None, 8, 128, 4, 512, 512, **options)
+
+
+@pytest.mark.parametrize("backend", ["nccl", "native"])
+@pytest.mark.parametrize("arch", [9, 10])
+@pytest.mark.parametrize("reserved_sms", [0, 16])
+def test_constructor_selects_backend_and_close_releases_handle(
+    monkeypatch, backend, arch, reserved_sms
+):
+    native = Mock()
+    monkeypatch.setitem(
+        sys.modules,
+        "optmoe_deepgemm",
+        SimpleNamespace(
+            get_mk_alignment_for_contiguous_layout=lambda: 128,
+            get_num_sms=lambda: 132 - reserved_sms,
+            get_symm_buffer_for_optmoe=Mock(),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "optmoe.persistent_backward",
+        SimpleNamespace(NativePersistentBackward=native),
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (arch, 0))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=132),
+    )
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    runtime = PersistentMoE(
+        None,
+        8,
+        128,
+        4,
+        512,
+        512,
+        backward_backend=backend,
+        reserved_sms=reserved_sms,
+    )
+    try:
+        assert runtime.num_sms == 132 - reserved_sms
+        assert _RUNTIMES[runtime._key] is runtime
+        if backend == "native":
+            native.assert_called_once_with(runtime)
+            assert runtime._peer_backward is native.return_value
+        else:
+            native.assert_not_called()
+            assert runtime._peer_backward is None
+    finally:
+        runtime.close()
+    assert runtime._key not in _RUNTIMES
+
+
+@pytest.mark.parametrize(
+    "dtype,arch,message",
+    [("mxfp8", 9, "mxfp8.*SM100"), ("blockwise", 10, "blockwise.*SM90")],
+)
+def test_fp8_format_rejected_on_wrong_architecture(monkeypatch, dtype, arch, message):
+    monkeypatch.setitem(sys.modules, "optmoe_deepgemm", SimpleNamespace())
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (arch, 0))
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    with pytest.raises(ValueError, match=message):
+        PersistentMoE(
+            None,
+            8,
+            128,
+            4,
+            512,
+            512,
+            compute_dtype=dtype,
+            backward_backend="native" if dtype == "blockwise" else "nccl",
+        )
+
+
+@pytest.mark.parametrize(
+    "arch,num_sms,wave", [(9, 132, 132 * 128), (10, 148, 74 * 128)]
+)
+def test_owned_backward_ring_floor_counts_clusters(monkeypatch, arch, num_sms, wave):
+    from optmoe.persistent_backward import owned_backward_ring_tokens
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (arch, 0))
+    monkeypatch.delenv("OPTMOE_BACKWARD_RING_WAVES", raising=False)
+    assert owned_backward_ring_tokens(num_sms) == wave
+    assert owned_backward_ring_tokens(num_sms, default_waves=2) == 2 * wave
+    monkeypatch.setenv("OPTMOE_BACKWARD_RING_WAVES", "0")
+    assert owned_backward_ring_tokens(num_sms, default_waves=2) == 0
+    monkeypatch.setenv("OPTMOE_BACKWARD_RING_WAVES", "-1")
+    with pytest.raises(ValueError, match=">= 0"):
+        owned_backward_ring_tokens(num_sms)
+
+
+def test_forward_ring_knobs_accept_any_non_negative_count(monkeypatch):
+    from optmoe import workspace_bound
+
+    monkeypatch.delenv("OPTMOE_FORWARD_RING_ROWS", raising=False)
+    assert workspace_bound.forward_ring_budget(16384, 8) == 163840
+    for value, budget in (("", 163840), ("0", 0), ("1", 1), ("1024", 1024)):
+        monkeypatch.setenv("OPTMOE_FORWARD_RING_ROWS", value)
+        assert workspace_bound.forward_ring_budget(16384, 8) == budget
+    monkeypatch.setenv("OPTMOE_FORWARD_RING_TOKENS", "1920")
+    assert workspace_bound.forward_ring_tokens(2048, 768, 1024) == 1920
+    checks = {
+        "OPTMOE_FORWARD_RING_ROWS": lambda: workspace_bound.forward_ring_budget(
+            16384, 8
+        ),
+        "OPTMOE_FORWARD_RING_TOKENS": lambda: workspace_bound.forward_ring_tokens(
+            2048, 768, 1024
+        ),
+    }
+    for name, check in checks.items():
+        for value in ("-1", "1k"):
+            monkeypatch.setenv(name, value)
+            with pytest.raises(ValueError, match=name):
+                check()
+        monkeypatch.delenv(name)
+
+
+def _backward_precision(compute_dtype, hidden):
+    pytest.importorskip("triton")
+    from optmoe.persistent_backward import NativePersistentBackward
+
+    backend = SimpleNamespace(
+        arch=10,
+        blockwise=False,
+        runtime=SimpleNamespace(compute_dtype=compute_dtype, hidden=hidden),
+        _mx_fallback_logged=False,
+    )
+    return NativePersistentBackward.precision(backend), backend
+
+
+@pytest.mark.parametrize(
+    "compute_dtype,hidden,env,expected",
+    [
+        ("bf16", 2048, None, "bf16"),
+        ("bf16", 2048, "mxfp8", "mxfp8"),
+        ("mxfp8", 2048, None, "mxfp8"),
+        ("mxfp8", 2048, "bf16", "bf16"),
+        ("mxfp8", 2304, None, "bf16"),
+    ],
+)
+def test_sm100_backward_precision_follows_the_runtime(
+    monkeypatch, compute_dtype, hidden, env, expected
+):
+    monkeypatch.delenv("OPTMOE_SM100_BACKWARD_PRECISION", raising=False)
+    if env is not None:
+        monkeypatch.setenv("OPTMOE_SM100_BACKWARD_PRECISION", env)
+    value, backend = _backward_precision(compute_dtype, hidden)
+    assert value == expected
+    # the MXFP8 runtime's automatic fallback for hidden % 512 is logged once
+    assert backend._mx_fallback_logged == (
+        compute_dtype == "mxfp8" and hidden % 512 != 0
+    )
+
+
+def test_sm100_explicit_mxfp8_backward_rejects_hidden_not_multiple_of_512(monkeypatch):
+    monkeypatch.setenv("OPTMOE_SM100_BACKWARD_PRECISION", "mxfp8")
+    with pytest.raises(ValueError, match="multiples of 512"):
+        _backward_precision("bf16", 2304)
+
+
+@pytest.mark.parametrize(
+    "policy,precision,stores",
+    [
+        ("auto", "bf16", True),
+        ("auto", "mxfp8", False),
+        ("recompute", "mxfp8", True),
+        ("always", "mxfp8", True),
+        ("off", "bf16", False),
+    ],
+)
+def test_stored_context_auto_declines_for_the_mxfp8_backward(
+    monkeypatch, policy, precision, stores
+):
+    from optmoe.runtime import _store_context
+
+    monkeypatch.setenv("OPTMOE_STORED_CONTEXT", policy)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+    monkeypatch.setattr(torch._C, "_current_graph_task_id", lambda: 0)
+    runtime = SimpleNamespace(
+        compute_dtype="bf16",
+        retain_activations=False,
+        _peer_backward=SimpleNamespace(
+            stored_context_usable=lambda: True, precision=lambda: precision
+        ),
+        _stored=SimpleNamespace(key="stale", decide_auto=lambda: True),
+    )
+    assert _store_context(runtime) is stores
+    assert runtime._stored.key is None
+
+
+def _dw_precision(compute_dtype, hidden):
+    pytest.importorskip("triton")
+    from optmoe.persistent_backward import NativePersistentBackward
+
+    backend = SimpleNamespace(
+        arch=10,
+        blockwise=False,
+        runtime=SimpleNamespace(compute_dtype=compute_dtype, hidden=hidden),
+        _mx_fallback_logged=False,
+    )
+    backend.precision = lambda: NativePersistentBackward.precision(backend)
+    return NativePersistentBackward.dw_precision(backend)
+
+
+@pytest.mark.parametrize(
+    "compute_dtype,backward_env,hidden,dw_env,defaults,expected",
+    [
+        # shipped defaults: MXFP8 dW on the MXFP8 runtime, BF16 dW on the BF16 runtime
+        ("mxfp8", None, 2048, None, {}, "mxfp8"),
+        ("bf16", "mxfp8", 2048, None, {}, "bf16"),
+        ("bf16", None, 2048, None, {}, "bf16"),
+        # the explicit selector wins in both directions
+        ("mxfp8", None, 2048, "mxfp8", {}, "mxfp8"),
+        ("bf16", "mxfp8", 2048, "mxfp8", {}, "mxfp8"),
+        ("bf16", None, 2048, "mxfp8", {}, "mxfp8"),
+        ("mxfp8", None, 2048, "bf16", {"mxfp8": "mxfp8"}, "bf16"),
+        # a runtime default applies to that runtime's MXFP8 backward only
+        ("mxfp8", None, 2048, None, {"mxfp8": "mxfp8"}, "mxfp8"),
+        ("bf16", "mxfp8", 2048, None, {"mxfp8": "mxfp8"}, "bf16"),
+        ("bf16", "mxfp8", 2048, None, {"bf16": "mxfp8"}, "mxfp8"),
+        ("mxfp8", "bf16", 2048, None, {"mxfp8": "mxfp8"}, "bf16"),
+        ("bf16", None, 2048, None, {"bf16": "mxfp8"}, "bf16"),
+        # hidden % 512 != 0 falls back to the BF16 backward and BF16 dW
+        ("mxfp8", None, 2304, None, {"mxfp8": "mxfp8"}, "bf16"),
+        ("mxfp8", None, 2304, "mxfp8", {}, "mxfp8"),
+    ],
+)
+def test_sm100_dw_precision_resolution(
+    monkeypatch, compute_dtype, backward_env, hidden, dw_env, defaults, expected
+):
+    pytest.importorskip("triton")
+    from optmoe import dw
+
+    for key, value in (
+        ("OPTMOE_SM100_BACKWARD_PRECISION", backward_env),
+        ("OPTMOE_SM100_DW_PRECISION", dw_env),
+    ):
+        monkeypatch.delenv(key, raising=False)
+        if value is not None:
+            monkeypatch.setenv(key, value)
+    for key, value in defaults.items():
+        monkeypatch.setitem(dw.MXFP8_BACKWARD_DW_DEFAULTS, key, value)
+    assert _dw_precision(compute_dtype, hidden) == expected
+
+
+def test_sm100_dw_precision_defaults():
+    pytest.importorskip("triton")
+    from optmoe.dw import MXFP8_BACKWARD_DW_DEFAULTS
+
+    assert MXFP8_BACKWARD_DW_DEFAULTS == {"bf16": "bf16", "mxfp8": "mxfp8"}
+
+
+def test_sm100_dw_precision_rejects_unknown_values(monkeypatch):
+    pytest.importorskip("triton")
+    from optmoe.dw import resolve_dw_precision
+
+    monkeypatch.setenv("OPTMOE_SM100_DW_PRECISION", "fp8")
+    with pytest.raises(ValueError, match="bf16 or mxfp8"):
+        resolve_dw_precision("mxfp8", "mxfp8")
+
+
+@pytest.mark.parametrize(
+    "transport,combine,expected",
+    [
+        (None, None, (True, True)),
+        ("1", None, (True, True)),
+        ("0", None, (False, False)),
+        ("1", "0", (True, False)),
+        ("0", "0", (False, False)),
+        ("0", "1", "requires SM90 FP8 transport"),
+        ("2", None, "TRANSPORT must be 0 or 1"),
+        (None, "yes", "COMBINE must be 0 or 1"),
+    ],
+)
+def test_sm90_fp8_transport_defaults(monkeypatch, transport, combine, expected):
+    from optmoe.persistent_backward import sm90_fp8_transport
+
+    for name, value in (
+        ("OPTMOE_SM90_FP8_TRANSPORT", transport),
+        ("OPTMOE_SM90_FP8_COMBINE", combine),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    if isinstance(expected, str):
+        with pytest.raises(ValueError, match=expected):
+            sm90_fp8_transport()
+    else:
+        assert sm90_fp8_transport() == expected

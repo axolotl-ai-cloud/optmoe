@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=77", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "optmoe"
+dynamic = ["version"]
+description = "OPTMoE: fused expert-parallel MoE training kernels for Hopper and Blackwell"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "vendor/deepgemm/LICENSE", "vendor/sonic-moe/LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Axolotl AI" }]
+dependencies = ["torch>=2.9", "triton>=3.4"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/axolotl-ai-cloud/optmoe"
+Documentation = "https://github.com/axolotl-ai-cloud/optmoe/tree/main/docs"
+Issues = "https://github.com/axolotl-ai-cloud/optmoe/issues"
+
+[project.optional-dependencies]
+sonic = ["transformers>=5.8", "kernels", "nvidia-cutlass-dsl==4.8.0"]
+
+[tool.setuptools_scm]
+fallback_version = "0.0.0"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["gpu: requires a CUDA GPU", "gpu_blackwell: requires Hopper or Blackwell", "slow: extended kernel compilation or validation"]
+
+[tool.setuptools.package-data]
+optmoe = ["include/*.cuh", "include/*.h", "include/*.cpp", "include/*.cu"]

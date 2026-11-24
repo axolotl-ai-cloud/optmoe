@@ -1,0 +1,107 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - "release/**" # builds only; the release and publish jobs run on tags
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # setuptools-scm derives the version from the tag
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          twine check dist/*
+      - name: Smoke-test the wheel
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+          /tmp/smoke/bin/pip install dist/*.whl
+          /tmp/smoke/bin/python -c "import optmoe; print(optmoe.__version__)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  # The compiled extension links one torch minor and one CUDA major, which PyPI wheel tags cannot
+  # express, so its wheels go to the GitHub release. Building needs the CUDA toolkit, not a GPU.
+  kernels:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.14"]
+        torch: ["2.14.1"]
+        cuda: ["13.0.2"]
+        torch-index: ["cu130"]
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Build the extension wheel
+        run: |
+          version=0.0.0.dev0
+          case "$GITHUB_REF" in
+            refs/tags/v*) version="${GITHUB_REF_NAME#v}" ;;
+          esac
+          docker run --rm -v "$PWD:/work" -w /work \
+            "nvidia/cuda:${{ matrix.cuda }}-devel-ubuntu24.04" \
+            tools/build_kernel_wheel.sh "${{ matrix.python }}" "${{ matrix.torch }}" "${{ matrix.torch-index }}" "$version"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernels-py${{ matrix.python }}-torch${{ matrix.torch }}-${{ matrix.torch-index }}
+          path: vendor/deepgemm/dist/*.whl
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, kernels]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and attach the extension wheels
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kernels-*
+          merge-multiple: true
+          path: kernels/
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" kernels/*.whl --title "$GITHUB_REF_NAME" --generate-notes
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, release]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/optmoe
+    permissions:
+      id-token: write # PyPI trusted publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
