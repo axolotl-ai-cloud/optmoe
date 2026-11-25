@@ -73,7 +73,7 @@ jobs:
           esac
           if [ -n "$ATTACH_TAG" ]; then version="${ATTACH_TAG#v}"; fi
           docker run --rm -v "$PWD:/work" -w /work \
-            "nvidia/cuda:${{ matrix.build.cuda }}-devel-ubuntu24.04" \
+            "nvidia/cuda:${{ matrix.build.cuda }}-devel-rockylinux8" \
             tools/build_kernel_wheel.sh "${{ matrix.python }}" "${{ matrix.build.torch }}" "${{ matrix.build.torch-index }}" "$version"
       - uses: actions/upload-artifact@v4
         with:
