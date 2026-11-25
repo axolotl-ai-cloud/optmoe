@@ -12,7 +12,12 @@ from dataclasses import dataclass
 import torch
 
 from .activation import swiglu
-from .ops import grouped_bf16, grouped_swiglu_backward, weight_grad_bf16
+from .ops import (
+    grouped_bf16,
+    grouped_swiglu_backward,
+    weight_grad_bf16,
+    weight_grad_bf16_gpu_offsets,
+)
 from .packing import combine_rows, pack_rows
 
 
@@ -89,6 +94,11 @@ def _gemm(x, w, layout, transpose=False):
 
 
 def _weight_grad(dy, x, layout, experts):
+    if layout.sizes is None and torch.cuda.get_device_capability()[0] == 9:
+        # SM90 has no prefix-sum K-grouped GEMM: the device layout's row ranges stay on the GPU
+        return weight_grad_bf16_gpu_offsets(
+            dy, x, layout.starts, layout.ends, x.shape[0]
+        )
     return weight_grad_bf16(
         dy, x, layout.k_sizes, layout.sizes, experts, layout.use_psum_layout
     )
